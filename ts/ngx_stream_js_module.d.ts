@@ -175,8 +175,10 @@ interface NginxStreamRequest {
     /**
      * Adds data to the chain of data chunks that will be forwarded in
      * the forward direction: in download callback to a client; in upload
-     * to an upstream server. The actual forwarding happens later, when the all
-     * the data chunks of the current chain are processed.
+     * to an upstream server. In a js_preread handler, data is flushed to the
+     * client and may also be sent from an asynchronous callback. The actual
+     * forwarding of filter data happens later, when all data chunks of the
+     * current chain are processed.
      *
      * @since 0.2.4
      * @param data Data to send.

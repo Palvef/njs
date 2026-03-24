@@ -74,6 +74,8 @@ struct ngx_stream_js_ctx_s {
     ngx_stream_js_ev_t      events[NGX_JS_EVENT_MAX];
     unsigned                filter:1;
     unsigned                in_progress:1;
+    unsigned                preread:1;
+    unsigned                preread_send:1;
     ngx_js_periodic_t      *periodic;
 };
 
@@ -936,14 +938,29 @@ ngx_stream_js_access_handler(ngx_stream_session_t *s)
 static ngx_int_t
 ngx_stream_js_preread_handler(ngx_stream_session_t *s)
 {
+    ngx_int_t                  rc;
+    ngx_stream_js_ctx_t       *ctx;
     ngx_stream_js_srv_conf_t  *jscf;
 
     ngx_log_debug0(NGX_LOG_DEBUG_STREAM, s->connection->log, 0,
                    "js preread handler");
 
-    jscf = ngx_stream_get_module_srv_conf(s, ngx_stream_js_module);
+    rc = ngx_stream_js_init_vm(s, ngx_stream_js_session_proto_id);
+    if (rc != NGX_OK) {
+        return rc;
+    }
 
-    return ngx_stream_js_phase_handler(s, &jscf->preread);
+    ctx  = ngx_stream_get_module_ctx(s, ngx_stream_js_module);
+    jscf = ngx_stream_get_module_srv_conf(s, ngx_stream_js_module);
+    ctx->preread = 1;
+
+    rc = ngx_stream_js_phase_handler(s, &jscf->preread);
+
+    if (rc == NGX_ERROR || !ctx->in_progress) {
+        ctx->preread = 0;
+    }
+
+    return rc;
 }
 
 
@@ -1041,6 +1058,10 @@ ngx_stream_js_body_filter(ngx_stream_session_t *s, ngx_chain_t *in,
     }
 
     ctx = ngx_stream_get_module_ctx(s, ngx_stream_js_module);
+
+    if (ctx->preread_send) {
+        return ngx_stream_next_filter(s, in, from_upstream);
+    }
 
     if (!ctx->filter) {
         ngx_log_debug1(NGX_LOG_DEBUG_STREAM, s->connection->log, 0,
@@ -1656,8 +1677,12 @@ ngx_stream_js_ext_send(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
 
     ctx = ngx_stream_get_module_ctx(s, ngx_stream_js_module);
 
-    if (!ctx->filter) {
+    if (!ctx->filter && !ctx->preread) {
         njs_vm_type_error(vm, "cannot send buffer in this handler");
+        return NJS_ERROR;
+
+    } else if (ctx->preread && from_upstream == NGX_JS_BOOL_FALSE) {
+        njs_vm_type_error(vm, "cannot send buffer upstream in preread");
         return NJS_ERROR;
     }
 
@@ -1676,7 +1701,7 @@ ngx_stream_js_ext_send(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
         last_buf = ctx->buf->last_buf;
 
     } else {
-        flush = 0;
+        flush = ctx->preread;
         last_buf = 0;
     }
 
@@ -1699,10 +1724,19 @@ ngx_stream_js_ext_send(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
                 from_upstream = njs_value_bool(value);
             }
 
-            if (value == NULL && ctx->buf == NULL) {
+            if (value == NULL && ctx->buf == NULL && !ctx->preread) {
                 goto exception;
             }
         }
+    }
+
+    if (ctx->preread) {
+        if (from_upstream == NGX_JS_BOOL_FALSE) {
+            njs_vm_type_error(vm, "cannot send buffer upstream in preread");
+            return NJS_ERROR;
+        }
+
+        from_upstream = NGX_JS_BOOL_TRUE;
     }
 
     cl = ngx_chain_get_free_buf(c->pool, &ctx->free);
@@ -1725,7 +1759,22 @@ ngx_stream_js_ext_send(njs_vm_t *vm, njs_value_t *args, njs_uint_t nargs,
     b->pos = b->start;
     b->last = b->end;
 
-    if (from_upstream == NGX_JS_BOOL_UNSET) {
+    if (ctx->preread) {
+        cl->next = NULL;
+        ctx->preread_send = 1;
+
+        if (ngx_stream_top_filter(s, cl, 1) == NGX_ERROR) {
+            ctx->preread_send = 0;
+            njs_vm_internal_error(vm, "ngx_stream_top_filter() failed");
+            return NJS_ERROR;
+        }
+
+        ctx->preread_send = 0;
+
+        ngx_chain_update_chains(c->pool, &ctx->free, &ctx->downstream_busy,
+                                &cl, (ngx_buf_tag_t) &ngx_stream_js_module);
+
+    } else if (from_upstream == NGX_JS_BOOL_UNSET) {
         *ctx->last_out = cl;
         ctx->last_out = &cl->next;
 
@@ -2410,8 +2459,11 @@ ngx_stream_qjs_ext_send(JSContext *cx, JSValueConst this_val, int argc,
 
     ctx = ngx_stream_get_module_ctx(s, ngx_stream_js_module);
 
-    if (!ctx->filter) {
+    if (!ctx->filter && !ctx->preread) {
         return JS_ThrowTypeError(cx, "cannot send buffer in this handler");
+
+    } else if (ctx->preread && from_upstream == NGX_JS_BOOL_FALSE) {
+        return JS_ThrowTypeError(cx, "cannot send buffer upstream in preread");
     }
 
     /*
@@ -2424,7 +2476,7 @@ ngx_stream_qjs_ext_send(JSContext *cx, JSValueConst this_val, int argc,
         last_buf = ctx->buf->last_buf;
 
     } else {
-        flush = 0;
+        flush = ctx->preread;
         last_buf = 0;
     }
 
@@ -2460,12 +2512,23 @@ ngx_stream_qjs_ext_send(JSContext *cx, JSValueConst this_val, int argc,
                 JS_FreeValue(cx, val);
             }
 
-            if (from_upstream == NGX_JS_BOOL_UNSET && ctx->buf == NULL) {
+            if (from_upstream == NGX_JS_BOOL_UNSET && ctx->buf == NULL
+                && !ctx->preread)
+            {
                 return JS_ThrowTypeError(cx, "from_upstream flag is "
                                          "expected when called "
                                          "asynchronously");
             }
         }
+    }
+
+    if (ctx->preread) {
+        if (from_upstream == NGX_JS_BOOL_FALSE) {
+            return JS_ThrowTypeError(cx, "cannot send buffer upstream "
+                                     "in preread");
+        }
+
+        from_upstream = NGX_JS_BOOL_TRUE;
     }
 
     val = argv[0];
@@ -2546,7 +2609,29 @@ string:
         buffer.data += len;
         buffer.len -= len;
 
-        if (from_upstream == NGX_JS_BOOL_UNSET) {
+        if (ctx->preread) {
+            cl->next = NULL;
+            ctx->preread_send = 1;
+
+            if (ngx_stream_top_filter(s, cl, 1) == NGX_ERROR) {
+                ctx->preread_send = 0;
+                if (str != NULL) {
+                    JS_FreeCString(cx, str);
+                }
+
+                JS_FreeValue(cx, buf);
+
+                return JS_ThrowInternalError(cx, "ngx_stream_top_filter() "
+                                             "failed");
+            }
+
+            ctx->preread_send = 0;
+
+            ngx_chain_update_chains(c->pool, &ctx->free,
+                                    &ctx->downstream_busy, &cl,
+                                    (ngx_buf_tag_t) &ngx_stream_js_module);
+
+        } else if (from_upstream == NGX_JS_BOOL_UNSET) {
             *ctx->last_out = cl;
             ctx->last_out = &cl->next;
 

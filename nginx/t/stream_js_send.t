@@ -64,6 +64,27 @@ stream {
         js_filter   test.filter_direct;
         proxy_pass  127.0.0.1:8090;
     }
+
+    server {
+        listen      127.0.0.1:8083;
+        js_preread  test.preread_sync;
+        js_filter   test.filter;
+        proxy_pass  127.0.0.1:8090;
+    }
+
+    server {
+        listen      127.0.0.1:8084;
+        js_preread  test.preread_async;
+        js_filter   test.filter;
+        proxy_pass  127.0.0.1:8090;
+    }
+
+    server {
+        listen      127.0.0.1:8085;
+        js_preread  test.preread_direct;
+        js_filter   test.filter;
+        proxy_pass  127.0.0.1:8090;
+    }
 }
 
 EOF
@@ -75,6 +96,10 @@ $t->write_file('test.js', <<EOF);
 
     function filter(s) {
       s.on("upload", async (data, flags) => {
+        if (!data.length) {
+            return;
+        }
+
         s.send("__HANDSHAKE__", flags);
 
         const p = new Promise((resolve, reject) => {
@@ -97,6 +122,10 @@ $t->write_file('test.js', <<EOF);
 
     function filter_direct(s) {
       s.on("upload", async (data, flags) => {
+        if (!data.length) {
+            return;
+        }
+
         s.sendUpstream("__HANDSHAKE__", flags);
 
         const p = new Promise((resolve, reject) => {
@@ -118,12 +147,54 @@ $t->write_file('test.js', <<EOF);
       });
     }
 
-    export default {njs:test_njs, filter, filter_direct};
+    function finish_preread(s) {
+        s.off("upload");
+        s.done();
+    }
+
+    function preread_sync(s) {
+        s.send("sync:");
+        s.on("upload", data => {
+            if (data.length) {
+                finish_preread(s);
+            }
+        });
+    }
+
+    function preread_async(s) {
+        s.on("upload", data => {
+            if (data.length) {
+                s.off("upload");
+                setTimeout(() => {
+                    s.send("async:");
+                    s.done();
+                }, 10);
+            }
+        });
+    }
+
+    function preread_direct(s) {
+        try {
+            s.sendUpstream("not-allowed");
+
+        } catch (e) {
+            s.sendDownstream('direct:' + (e instanceof TypeError) + ':');
+        }
+
+        s.on("upload", data => {
+            if (data.length) {
+                finish_preread(s);
+            }
+        });
+    }
+
+    export default {njs:test_njs, filter, filter_direct, preread_sync,
+                    preread_async, preread_direct};
 
 EOF
 
 $t->run_daemon(\&stream_daemon, port(8090));
-$t->try_run('no stream njs available')->plan(2);
+$t->try_run('no stream njs available')->plan(5);
 $t->waitforsocket('127.0.0.1:' . port(8090));
 
 ###############################################################################
@@ -132,6 +203,12 @@ is(stream('127.0.0.1:' . port(8081))->io('abc'), 'ABC',
 	'async filter');;
 is(stream('127.0.0.1:' . port(8082))->io('abc'), 'xxxABC',
 	'async filter direct');
+is(stream('127.0.0.1:' . port(8083))->io('abc'), 'sync:ABC',
+	'preread send');
+is(stream('127.0.0.1:' . port(8084))->io('abc'), 'async:ABC',
+	'async preread send');
+is(stream('127.0.0.1:' . port(8085))->io('abc'), 'direct:true:ABC',
+	'preread send downstream');
 
 $t->stop();
 
