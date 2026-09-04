@@ -1,9 +1,12 @@
 const PROTO_VER = 31;
-const QUEUE_POLL_MS = 1000;
-const QUEUE_NOTICE_MS = 60000;
-const QUEUE_ENTRY_TTL_MS = 120000;
-const QUEUE_LOCK_TTL_MS = 1000;
-const ACTIVE_REFRESH_MS = 30000;
+const DEFAULT_QUEUE_POLL_SECONDS = 1;
+const QUEUE_NOTICE_SECONDS = 60;
+const DEFAULT_QUEUE_ENTRY_TTL_SECONDS = 120;
+const MIN_QUEUE_ENTRY_TTL_SECONDS = 1;
+const QUEUE_LOCK_TTL_SECONDS = 1;
+const QUEUE_LOCK_RETRY_SECONDS = 0.01;
+const DEFAULT_ACTIVE_REFRESH_SECONDS = 30;
+const NEXT_TICKET_TTL_SECONDS = 86400;
 
 const INIT = 0;
 const VER_RECV = 1;
@@ -21,8 +24,14 @@ let queueWaitKey = '';
 let queueActiveKey = '';
 let queuePollTimer;
 let activeRefreshTimer;
-let queuedAt = 0;
-let lastNoticeAt = 0;
+let queueEntryTtlSeconds = DEFAULT_QUEUE_ENTRY_TTL_SECONDS;
+let queuePollSeconds = DEFAULT_QUEUE_POLL_SECONDS;
+let activeRefreshSeconds = DEFAULT_ACTIVE_REFRESH_SECONDS;
+let queuedAtSeconds = 0;
+let joinedAtPosition = 0;
+let lastNoticeAtSeconds = 0;
+let lastNoticePosition = 0;
+let lastNoticeTotal = -1;
 let cleanupRegistered = false;
 
 let clientAddr = '';
@@ -82,6 +91,29 @@ function queueDict() {
     return ngx.shared.rsync_queue;
 }
 
+function nowSeconds() {
+    return Date.now() / 1000;
+}
+
+function timerDelay(seconds) {
+    return seconds * 1000;
+}
+
+function configureQueueTiming(s) {
+    const configured = Number(s.variables.rsync_queue_entry_ttl);
+    const seconds = Number.isFinite(configured) && configured > 0
+                    ? Math.max(MIN_QUEUE_ENTRY_TTL_SECONDS, configured)
+                    : DEFAULT_QUEUE_ENTRY_TTL_SECONDS;
+
+    queueEntryTtlSeconds = seconds;
+
+    const renewalSeconds = Math.max(0.1, queueEntryTtlSeconds / 4);
+
+    queuePollSeconds = Math.min(DEFAULT_QUEUE_POLL_SECONDS, renewalSeconds);
+    activeRefreshSeconds = Math.min(DEFAULT_ACTIVE_REFRESH_SECONDS,
+                                    renewalSeconds);
+}
+
 function prefixedKeys(prefix) {
     return queueDict().keys().filter(key => key.startsWith(prefix));
 }
@@ -105,13 +137,13 @@ function setQueueVariable(s, name, value) {
     s.variables[name] = String(value);
 }
 
-function setQueueState(s, value) {
-    setQueueVariable(s, 'rsync_queue_state', value);
+function setSessionStatus(s, code) {
+    setQueueVariable(s, 'rsync_status_code', code);
 }
 
-function updateWaitVariables(s, position) {
-    setQueueVariable(s, 'rsync_queue_position', position);
-    setQueueVariable(s, 'rsync_queue_wait_ms', Date.now() - queuedAt);
+function updateWaitVariable(s) {
+    setQueueVariable(s, 'rsync_queue_wait_seconds',
+                     (nowSeconds() - queuedAtSeconds).toFixed(3));
 }
 
 function renderQueueMessage(s, variable, fallback, values) {
@@ -135,14 +167,26 @@ function queueMessageValues(s, position, total, waitSeconds) {
     };
 }
 
+function cancelTimer(timer) {
+    if (timer === undefined) {
+        return;
+    }
+
+    try {
+        clearTimeout(timer);
+    } catch (e) {
+        // The callback may already have been dequeued when the client closed.
+    }
+}
+
 function cleanupQueueEntry() {
     if (queuePollTimer !== undefined) {
-        clearTimeout(queuePollTimer);
+        cancelTimer(queuePollTimer);
         queuePollTimer = undefined;
     }
 
     if (activeRefreshTimer !== undefined) {
-        clearTimeout(activeRefreshTimer);
+        cancelTimer(activeRefreshTimer);
         activeRefreshTimer = undefined;
     }
 
@@ -165,8 +209,9 @@ function refreshActiveSlot() {
         return;
     }
 
-    queueDict().set(queueActiveKey, 1, QUEUE_ENTRY_TTL_MS);
-    activeRefreshTimer = setTimeout(refreshActiveSlot, ACTIVE_REFRESH_MS);
+    queueDict().set(queueActiveKey, 1, timerDelay(queueEntryTtlSeconds));
+    activeRefreshTimer = setTimeout(refreshActiveSlot,
+                                    timerDelay(activeRefreshSeconds));
 }
 
 function registerCleanup() {
@@ -182,8 +227,11 @@ function withBackendLock(s, callback) {
     const dict = queueDict();
     const lockKey = `lock:${queueBackend}`;
 
-    if (!dict.add(lockKey, 1, QUEUE_LOCK_TTL_MS)) {
-        queuePollTimer = setTimeout(() => withBackendLock(s, callback), 10);
+    if (!dict.add(lockKey, 1, timerDelay(QUEUE_LOCK_TTL_SECONDS))) {
+        queuePollTimer = setTimeout(() => {
+            queuePollTimer = undefined;
+            withBackendLock(s, callback);
+        }, timerDelay(QUEUE_LOCK_RETRY_SECONDS));
         return;
     }
 
@@ -196,7 +244,8 @@ function withBackendLock(s, callback) {
 }
 
 function sendQueueNotice(s, position, total, initial) {
-    const values = queueMessageValues(s, position, total, 0);
+    const waitSeconds = Math.ceil(nowSeconds() - queuedAtSeconds);
+    const values = queueMessageValues(s, position, total, waitSeconds);
     let message = '';
 
     if (initial) {
@@ -212,7 +261,9 @@ function sendQueueNotice(s, position, total, initial) {
     s.sendDownstream(message);
     s.log(`rsync queue: backend=${queueBackend} module=${requestedModule} `
           + `ticket=${queueTicket} position=${position} total=${total}`);
-    lastNoticeAt = Date.now();
+    lastNoticeAtSeconds = nowSeconds();
+    lastNoticePosition = position;
+    lastNoticeTotal = total;
 }
 
 function activate(s, wasQueued) {
@@ -224,21 +275,21 @@ function activate(s, wasQueued) {
     }
 
     queueActiveKey = `active:${queueBackend}:${queueTicket}`;
-    dict.set(queueActiveKey, 1, QUEUE_ENTRY_TTL_MS);
-    setQueueState(s, wasQueued ? 'admitted' : 'active');
+    dict.set(queueActiveKey, 1, timerDelay(queueEntryTtlSeconds));
+    setSessionStatus(s, 200);
 
     if (wasQueued) {
-        const waited = Date.now() - queuedAt;
-        updateWaitVariables(s, 0);
+        const waitedSeconds = nowSeconds() - queuedAtSeconds;
+        updateWaitVariable(s);
         const values = queueMessageValues(s, 0,
                                           sortedWaitKeys(queueBackend).length,
-                                          Math.ceil(waited / 1000));
+                                          Math.ceil(waitedSeconds));
         s.sendDownstream(renderQueueMessage(s, 'rsync_queue_admitted_message',
                          'Queue slot acquired after {wait_seconds} seconds. '
                          + 'Connecting to the upstream.', values));
         s.log(`rsync queue admitted: backend=${queueBackend} `
               + `module=${requestedModule} ticket=${queueTicket} `
-              + `wait_ms=${waited}`);
+              + `wait_seconds=${waitedSeconds.toFixed(3)}`);
     }
 
     queuePollTimer = undefined;
@@ -252,12 +303,12 @@ function pollQueue(s) {
 
         if (!queueWaitKey || !dict.has(queueWaitKey)) {
             s.sendDownstream('@ERROR: Queue entry expired; please retry.\n');
-            setQueueState(s, 'expired');
-            s.deny();
+            setSessionStatus(s, 503);
+            s.done(503);
             return;
         }
 
-        dict.set(queueWaitKey, 1, QUEUE_ENTRY_TTL_MS);
+        dict.set(queueWaitKey, 1, timerDelay(queueEntryTtlSeconds));
 
         const waits = sortedWaitKeys(queueBackend);
         const index = waits.indexOf(queueWaitKey);
@@ -268,23 +319,30 @@ function pollQueue(s) {
             return;
         }
 
-        updateWaitVariables(s, position);
+        updateWaitVariable(s);
 
-        if (Date.now() - lastNoticeAt >= QUEUE_NOTICE_MS) {
+        if (position !== lastNoticePosition
+            || waits.length !== lastNoticeTotal
+            || nowSeconds() - lastNoticeAtSeconds >= QUEUE_NOTICE_SECONDS)
+        {
             sendQueueNotice(s, position, waits.length, false);
         }
 
-        queuePollTimer = setTimeout(() => pollQueue(s), QUEUE_POLL_MS);
+        queuePollTimer = setTimeout(() => {
+            queuePollTimer = undefined;
+            pollQueue(s);
+        }, timerDelay(queuePollSeconds));
     });
 }
 
 function acquireQueue(s) {
     queueBackend = s.variables.rsync_backend || 'default';
+    configureQueueTiming(s);
     const maxActive = Number(s.variables.rsync_max_active) || 0;
     const maxQueued = Number(s.variables.rsync_max_queued) || 0;
 
     if (maxActive <= 0) {
-        setQueueState(s, 'unlimited');
+        setSessionStatus(s, 200);
         s.done();
         return;
     }
@@ -296,7 +354,8 @@ function acquireQueue(s) {
         const waits = sortedWaitKeys(queueBackend);
         const nextKey = `next:${queueBackend}`;
 
-        queueTicket = dict.incr(nextKey, 1, 0, 86400000);
+        queueTicket = dict.incr(nextKey, 1, 0,
+                                timerDelay(NEXT_TICKET_TTL_SECONDS));
 
         if (waits.length === 0
             && activeKeys(queueBackend).length < maxActive)
@@ -306,42 +365,64 @@ function acquireQueue(s) {
         }
 
         if (maxQueued > 0 && waits.length >= maxQueued) {
-            setQueueState(s, 'full');
+            setSessionStatus(s, 429);
             const values = queueMessageValues(s, 0, waits.length, 0);
             s.sendDownstream(renderQueueMessage(s, 'rsync_queue_full_message',
                              '@ERROR: Server queue is full for upstream '
                              + '{backend}; please retry later.', values));
             s.warn(`rsync queue full: backend=${queueBackend} `
                    + `module=${requestedModule}`);
-            s.deny();
+            s.done(429);
             return;
         }
 
-        queuedAt = Date.now();
+        queuedAtSeconds = nowSeconds();
+        joinedAtPosition = waits.length + 1;
         queueWaitKey = `wait:${queueBackend}:${queueTicket}`;
-        dict.set(queueWaitKey, 1, QUEUE_ENTRY_TTL_MS);
-        setQueueState(s, 'queued');
+        dict.set(queueWaitKey, 1, timerDelay(queueEntryTtlSeconds));
+        setSessionStatus(s, 429);
         setQueueVariable(s, 'rsync_queue_queued', 'true');
-        updateWaitVariables(s, waits.length + 1);
+        updateWaitVariable(s);
         sendQueueNotice(s, waits.length + 1, waits.length + 1, true);
-        queuePollTimer = setTimeout(() => pollQueue(s), QUEUE_POLL_MS);
+        queuePollTimer = setTimeout(() => {
+            queuePollTimer = undefined;
+            pollQueue(s);
+        }, timerDelay(queuePollSeconds));
+    });
+}
+
+function monitorQueuedClient(s) {
+    s.on('upstream', (data, flags) => {
+        if (!flags.last) {
+            return;
+        }
+
+        cleanupQueueEntry();
+        setSessionStatus(s, 429);
+        s.done(429);
     });
 }
 
 function preread(s) {
     let readPos = 0;
 
+    if (s.variables.rsync_forbidden === '1') {
+        setSessionStatus(s, 403);
+        s.done(403);
+        return;
+    }
+
     if (!handshakeSent) {
         s.send(`@RSYNCD: ${PROTO_VER}.0\n`);
         handshakeSent = true;
-        setQueueState(s, 'parsing');
         registerCleanup();
     }
 
-    s.on('upstream', (data) => {
+    s.on('upstream', (data, flags) => {
         while (true) {
             if (state === MODULE_RECV) {
                 s.off('upstream');
+                monitorQueuedClient(s);
                 acquireQueue(s);
                 return;
             }
@@ -351,12 +432,18 @@ function preread(s) {
             const result = readLine(data, readPos);
 
             if (result === null) {
+                if (flags.last) {
+                    setSessionStatus(s, 500);
+                    s.done(500);
+                }
+
                 return;
             }
 
             if (result.error) {
                 s.sendDownstream('@ERROR: protocol startup error\n');
-                s.deny();
+                setSessionStatus(s, 500);
+                s.done(500);
                 return;
             }
 
@@ -367,7 +454,8 @@ function preread(s) {
 
                 if (clientVer.proto === undefined) {
                     s.sendDownstream('@ERROR: protocol startup error\n');
-                    s.deny();
+                    setSessionStatus(s, 500);
+                    s.done(500);
                     return;
                 }
 
@@ -376,7 +464,8 @@ function preread(s) {
                 {
                     s.sendDownstream('@ERROR: your client is speaking an '
                                      + 'incompatible beta of protocol 30\n');
-                    s.deny();
+                    setSessionStatus(s, 500);
+                    s.done(500);
                     return;
                 }
 
@@ -410,7 +499,7 @@ function filter(s) {
 
     if (queueActiveKey && activeRefreshTimer === undefined) {
         activeRefreshTimer = setTimeout(refreshActiveSlot,
-                                        ACTIVE_REFRESH_MS);
+                                        timerDelay(activeRefreshSeconds));
     }
 
     s.on('upstream', (data, flags) => {
@@ -497,7 +586,9 @@ function negVer() {
 }
 
 function cliVer() {
-    return clientVer === undefined ? '-' : `${clientVer.proto}.${clientVer.sub}`;
+    return clientVer === undefined || clientVer.proto === undefined
+           ? '-'
+           : `${clientVer.proto}.${clientVer.sub}`;
 }
 
 function clientEndpoint(s) {
@@ -508,17 +599,13 @@ function serverEndpoint(s) {
     return serverAddr || `${s.variables.server_addr}:${s.variables.server_port}`;
 }
 
-function queueDepth(s) {
-    const backend = queueBackend || s.variables.rsync_backend || 'default';
-
+function initialQueuePosition() {
     // This function is evaluated by the access log when the stream session
-    // finishes.  Releasing the ticket here also cancels refresh/poll timers,
-    // so an aborted queued client or a completed transfer frees its slot
-    // immediately instead of waiting for the shared-dictionary TTL.
+    // finishes. Releasing the ticket here also cancels refresh/poll timers.
     cleanupQueueEntry();
 
-    return sortedWaitKeys(backend).length;
+    return joinedAtPosition;
 }
 
 export default {preread, filter, moduleName, negVer, cliVer, clientEndpoint,
-                serverEndpoint, queueDepth};
+                serverEndpoint, initialQueuePosition};
