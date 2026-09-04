@@ -511,6 +511,12 @@ function serverEndpoint(s) {
 function queueDepth(s) {
     const backend = queueBackend || s.variables.rsync_backend || 'default';
 
+    // This function is evaluated by the access log when the stream session
+    // finishes.  Releasing the ticket here also cancels refresh/poll timers,
+    // so an aborted queued client or a completed transfer frees its slot
+    // immediately instead of waiting for the shared-dictionary TTL.
+    cleanupQueueEntry();
+
     return sortedWaitKeys(backend).length;
 }
 

@@ -28,3 +28,36 @@ The active and waiting entries expire after a worker crash. Active entries are
 refreshed while their proxied sessions remain open. Access logs expose whether
 the request waited (`queued`) and the live number of waiting requests
 (`queue_depth`).
+
+## Access log fields
+
+The example `rsync_example` log format records the following fields:
+
+| Field | Meaning |
+| --- | --- |
+| `$remote_addr` | Client address seen by nginx. |
+| `module` | Module name requested by the rsync client, or `-` when the handshake did not reach the module line. |
+| `backend` | Upstream selected by the `$rsync_module` to `$rsync_backend` map. |
+| `state` | Queue lifecycle state described below. |
+| `queued` | `true` when the connection waited at any point; it remains `true` after admission. |
+| `queue_depth` | Number of clients still waiting for the same backend when this session is logged, after this session's own ticket is released. |
+| `position` | Most recently observed one-based queue position; reset to `0` after admission. |
+| `wait_ms` | Time spent waiting in milliseconds, or `0` when the connection never queued. |
+
+`state` can have these values:
+
+| State | Meaning |
+| --- | --- |
+| `initializing` | Initial value before the preread handler starts. |
+| `parsing` | Reading the rsync version and requested module. |
+| `unlimited` | The selected backend has `rsync_max_active=0`, so no queue is applied. |
+| `active` | The connection obtained an active slot without waiting. |
+| `queued` | The connection is waiting for an active slot. |
+| `admitted` | A previously queued connection obtained a slot. |
+| `full` | The configured waiting queue was full and the connection was rejected. |
+| `expired` | The waiting ticket expired before admission. |
+
+Keep `$rsync_queue_depth` in an access log format that is written when the
+session ends. Besides reporting the live depth, evaluating this variable
+releases the session's active or waiting ticket immediately and cancels its
+queue timers. The shared-dictionary timeout remains a crash-recovery fallback.
